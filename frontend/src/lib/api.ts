@@ -73,21 +73,6 @@ export async function analyzeCandidate(
   });
 }
 
-export interface Investigation {
-    id: number;
-    brand_id: number;
-    brand_name: string;
-    candidate_name: string;
-    candidate_url: string;
-    candidate_handle: string;
-    publisher_name: string;
-    risk_score: number;
-    risk_level: string;
-    disclaimer: string;
-    created_at: string;
-    signals: RiskSignal[];
-  }
-  
   export async function getInvestigations(): Promise<Investigation[]> {
     const data = await request<{
       count: number;
