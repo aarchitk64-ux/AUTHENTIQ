@@ -10,10 +10,21 @@ DISCLAIMER = (
     "Verify the evidence independently before taking action."
 )
 
+VALID_CANDIDATE_TYPES = {"social_profile", "app_listing"}
+
+
+def safe_text(value) -> str:
+    """Convert optional input values into safe strings."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    return value.strip()
+
 
 def normalize_text(value: str) -> str:
     """Normalize text and common number-to-letter substitutions."""
-    value = value.lower()
+    value = safe_text(value).lower()
 
     substitutions = {
         "0": "o",
@@ -32,18 +43,19 @@ def normalize_text(value: str) -> str:
 
 def get_domain(url: str) -> str:
     """Extract a lowercase hostname from a URL."""
-    if not url or not url.strip():
-        return ""
+    value = safe_text(url)
 
-    value = url.strip()
+    if not value:
+        return ""
 
     if "://" not in value:
         value = "https://" + value
 
     try:
-        hostname = urlparse(value).hostname or ""
-        return hostname.lower().removeprefix("www.")
-    except ValueError:
+        parsed = urlparse(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        return hostname.removeprefix("www.")
+    except (ValueError, AttributeError):
         return ""
 
 
@@ -62,14 +74,18 @@ def similarity_score(first: str, second: str) -> int:
 
 def handle_identity(handle: str) -> str:
     """Normalize a social handle or profile URL."""
-    value = handle.strip().rstrip("/")
+    value = safe_text(handle).rstrip("/")
 
     if not value:
         return ""
 
     if "://" in value:
-        path = urlparse(value).path.strip("/")
-        value = path.split("/")[-1] if path else ""
+        try:
+            parsed = urlparse(value)
+            path = parsed.path.strip("/")
+            value = path.split("/")[-1] if path else ""
+        except ValueError:
+            return ""
 
     return normalize_text(value.lstrip("@"))
 
@@ -84,18 +100,26 @@ def analyze_candidate(
     publisher_name: str = "",
     candidate_type: str = "social_profile",
 ) -> dict:
-    """Calculate an explainable heuristic risk score."""
+    """Calculate a bounded, explainable heuristic risk score."""
 
-    if candidate_type not in {"social_profile", "app_listing"}:
+    if candidate_type not in VALID_CANDIDATE_TYPES:
         raise ValueError(
             "candidate_type must be social_profile or app_listing"
         )
+
+    brand_name = safe_text(brand_name)
+    official_website = safe_text(official_website)
+    candidate_name = safe_text(candidate_name)
+    candidate_url = safe_text(candidate_url)
+    candidate_handle = safe_text(candidate_handle)
+    publisher_name = safe_text(publisher_name)
 
     signals = []
     score = 0
 
     def add_signal(name: str, points: int, details: str) -> None:
         nonlocal score
+
         signals.append({
             "name": name,
             "points": points,
@@ -103,18 +127,28 @@ def analyze_candidate(
         })
         score += points
 
+    brand_normalized = normalize_text(brand_name)
+    candidate_normalized = normalize_text(candidate_name)
+
     official_domain = get_domain(official_website)
     candidate_domain = get_domain(candidate_url)
 
+    supplied_handles = (
+        official_social_handles
+        if isinstance(official_social_handles, (list, tuple, set))
+        else []
+    )
+
     official_handles = {
         handle_identity(handle)
-        for handle in official_social_handles
+        for handle in supplied_handles
         if handle_identity(handle)
     }
 
     candidate_identity = handle_identity(candidate_handle)
 
-    # Recognize a registered official social handle.
+    # A registered handle is a configured match, not independent
+    # verification of account ownership.
     if (
         candidate_type == "social_profile"
         and candidate_identity
@@ -128,38 +162,37 @@ def analyze_candidate(
                 "points": 0,
                 "details": (
                     "The supplied handle matches a registered official "
-                    "handle. This does not independently verify "
-                    "account ownership."
+                    "handle. This configured match does not independently "
+                    "verify account ownership."
                 ),
             }],
             "disclaimer": DISCLAIMER,
         }
 
-    brand_normalized = normalize_text(brand_name)
-    candidate_normalized = normalize_text(candidate_name)
-    name_similarity = similarity_score(brand_name, candidate_name)
-
-    # Candidate-name analysis.
-    if (
-        brand_normalized
-        and brand_normalized in candidate_normalized
-    ):
+    # 1. Candidate-name analysis.
+    if brand_normalized and brand_normalized in candidate_normalized:
         add_signal(
             "Brand name appears in candidate name",
             30,
             f"The candidate name contains a normalized match for "
-            f"'{brand_name}'. Authorized partners or resellers may "
-            "also legitimately mention a brand.",
+            f"'{brand_name}'. Authorized partners, resellers, and support "
+            "accounts may also legitimately mention a brand.",
         )
-    elif name_similarity >= 55:
-        add_signal(
-            "Similar brand name",
-            20,
-            f"The normalized candidate name has {name_similarity}% "
-            "similarity to the registered brand name.",
+    else:
+        name_similarity = similarity_score(
+            brand_name,
+            candidate_name,
         )
 
-    # Social-handle analysis applies only to social profiles.
+        if name_similarity >= 55:
+            add_signal(
+                "Similar brand name",
+                20,
+                f"The normalized candidate name has {name_similarity}% "
+                "similarity to the registered brand name.",
+            )
+
+    # 2. Social-handle analysis.
     if candidate_type == "social_profile":
         handle_normalized = normalize_text(candidate_handle)
 
@@ -172,14 +205,12 @@ def analyze_candidate(
             add_signal(
                 "Brand-like social handle",
                 15,
-                "The candidate handle contains a normalized match "
-                "for the brand but is not a registered official handle.",
+                "The candidate handle contains a normalized match for "
+                "the brand but is not a registered official handle. "
+                "This is a similarity signal, not proof of impersonation.",
             )
 
-    # Domain analysis.
-    # Only flag a look-alike when the hostname's first label resembles
-    # the official domain's first label. Do not treat every subdomain
-    # containing a brand word as a suspicious registered domain.
+    # 3. Website-domain analysis.
     if candidate_domain and official_domain:
         if candidate_domain == official_domain:
             signals.append({
@@ -187,109 +218,81 @@ def analyze_candidate(
                 "points": 0,
                 "details": (
                     "The hostname matches the registered official "
-                    "hostname. This alone does not verify identity."
+                    "hostname. This alone does not verify the identity "
+                    "or legitimacy of the specific page."
                 ),
             })
+
+        elif candidate_domain.endswith("." + official_domain):
+            signals.append({
+                "name": "Official domain subdomain",
+                "points": 0,
+                "details": (
+                    "The hostname is a subdomain of the registered "
+                    "official hostname. Verify the specific service "
+                    "before trusting it."
+                ),
+            })
+
         else:
             official_label = official_domain.split(".")[0]
             candidate_label = candidate_domain.split(".")[0]
 
-            # Detect subdomains of the official hostname.
-            is_official_subdomain = candidate_domain.endswith(
-                "." + official_domain
+            official_label_normalized = normalize_text(official_label)
+            candidate_label_normalized = normalize_text(candidate_label)
+
+            domain_similarity = similarity_score(
+                official_label,
+                candidate_label,
             )
 
-            # For this prototype, avoid flagging a brand-like subdomain
-            # when it is hosted beneath a different parent hostname,
-            # such as nike-shop.example.com.
-            candidate_parts = candidate_domain.split(".")
-            official_parts = official_domain.split(".")
-
-            candidate_parent = (
-                ".".join(candidate_parts[-2:])
-                if len(candidate_parts) >= 2
-                else candidate_domain
-            )
-            official_parent = (
-                ".".join(official_parts[-2:])
-                if len(official_parts) >= 2
-                else official_domain
+            # A brand embedded in a different hostname can be relevant
+            # even when the entire hostname is not a close string match.
+            brand_in_hostname = (
+                bool(official_label_normalized)
+                and official_label_normalized in candidate_label_normalized
+                and candidate_label_normalized != official_label_normalized
             )
 
-            same_parent = candidate_parent == official_parent
-
-            if is_official_subdomain:
-                signals.append({
-                    "name": "Official domain subdomain",
-                    "points": 0,
-                    "details": (
-                        "The hostname is a subdomain of the registered "
-                        "official hostname. Verify the specific service "
-                        "before trusting it."
-                    ),
-                })
-            elif same_parent:
-                signals.append({
-                    "name": "Same parent domain",
-                    "points": 0,
-                    "details": (
-                        "The hostname shares the same basic parent-domain "
-                        "label as the registered domain."
-                    ),
-                })
-            else:
-                domain_similarity = similarity_score(
-                    official_label,
-                    candidate_label,
+            if domain_similarity >= 75 or brand_in_hostname:
+                add_signal(
+                    "Look-alike domain",
+                    30,
+                    f"Candidate hostname '{candidate_domain}' resembles "
+                    f"or contains the registered hostname label "
+                    f"'{official_label}'. Similarity alone does not "
+                    "prove abuse; independently verify domain ownership.",
                 )
 
-                official_label_normalized = normalize_text(official_label)
-                candidate_label_normalized = normalize_text(candidate_label)
-
-                looks_like_brand = (
-    domain_similarity >= 75
-    or (
-        len(official_label_normalized) >= 4
-        and official_label_normalized
-        in candidate_label_normalized
-        and candidate_domain.endswith("." + official_domain)
-    )
-)
-
-                if looks_like_brand:
-                    add_signal(
-                        "Look-alike domain",
-                        30,
-                        f"Candidate hostname '{candidate_domain}' "
-                        f"resembles the registered hostname "
-                        f"'{official_domain}'. Similarity alone does "
-                        "not prove abuse.",
-                    )
-
-    # Publisher comparison applies only to mobile app listings.
-    if candidate_type == "app_listing" and publisher_name.strip():
+    # 4. Publisher analysis for mobile-app listings.
+    if candidate_type == "app_listing" and publisher_name:
         publisher_normalized = normalize_text(publisher_name)
 
-        if publisher_normalized != brand_normalized:
+        if (
+            brand_normalized
+            and publisher_normalized
+            and publisher_normalized != brand_normalized
+        ):
             add_signal(
                 "Publisher name differs from brand",
                 10,
                 f"Publisher '{publisher_name}' differs from the "
                 f"registered brand name '{brand_name}'. Authorized "
-                "developers or subsidiaries may publish apps.",
+                "developers, subsidiaries, and contractors may publish "
+                "legitimate apps.",
             )
 
-    # Keep scores within the 0–100 range.
-    score = min(score, 100)
+    # 5. Clamp the total score to the supported range.
+    score = max(0, min(score, 100))
 
+    # Keep risk labels compatible with tests expecting Low, Medium,
+    # or High. The official-handle early return remains a special case.
     if score >= 70:
         level = "High"
     elif score >= 40:
         level = "Medium"
-    elif score >= 15:
-        level = "Low"
     else:
-        level = "Minimal"
+        level = "Low"
 
     if not signals:
         signals.append({
@@ -297,7 +300,7 @@ def analyze_candidate(
             "points": 0,
             "details": (
                 "No configured risk rules matched. This does not "
-                "establish that the candidate is safe."
+                "establish that the candidate is safe or authentic."
             ),
         })
 
