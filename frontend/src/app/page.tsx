@@ -5,8 +5,9 @@ import { useCallback, useEffect, useState } from "react";
 import AnalyzeCandidate from "./AnalyzeCandidate";
 
 import { getInvestigations, type Investigation } from "../lib/api";
-
-const API_URL = "http://127.0.0.1:8000";
+const API_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  "http://127.0.0.1:8000";
 
 type Brand = {
 
